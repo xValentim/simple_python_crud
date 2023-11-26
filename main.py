@@ -1,170 +1,75 @@
-import aiomysql
-import asyncio
-import boto3
-import logging
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 import os
-import time
-from botocore.exceptions import ClientError, NoCredentialsError
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-
-async def get_secret():
-    secret_name = "app/mysql/credentials"
-    region_name = "us-east-1"
-
-    # Create a Secrets Manager client
-    session = boto3.session.Session()
-    client = session.client(
-        service_name='secretsmanager',
-        region_name=region_name
-    )
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        # Unpack the dictionary into keyword arguments
-        get_secret_value_response = await loop.run_in_executor(
-            None,  # Uses the default executor
-            lambda: client.get_secret_value(SecretId=secret_name)
-        )
-    except ClientError as e:
-        raise e
-
-    # Decrypts secret using the associated KMS key.
-    secret = get_secret_value_response['SecretString']
-
-    return eval(secret)
 
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger()
+app = FastAPI()
 
-# Create a CloudWatch log client
-try:
-    log_client = boto3.client('logs', region_name="us-east-1")
-except NoCredentialsError:
-    logger.error("AWS credentials not found")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+print(DB_HOST)
+database_url = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:3306/{DB_NAME}"
+if database_url is None:
+    raise Exception("DATABASE_URL not set in environment variables")
 
-LOG_GROUP = '/my-fastapi-app/logs'
-LOG_STREAM = os.getenv("INSTANCE_ID")
+engine = create_engine(database_url)
+Base = declarative_base()
 
-# Function to push logs to CloudWatch
-import asyncio
+class Item(Base):
+    __tablename__ = 'items'
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), index=True)
+    description = Column(String(255), index=True)
+SessionLocal = sessionmaker(bind=engine)
 
-async def push_logs_to_cloudwatch(log_message):
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(
-            None,  # Uses the default executor (which is a ThreadPoolExecutor)
-            lambda: log_client.put_log_events(
-                logGroupName=LOG_GROUP,
-                logStreamName=LOG_STREAM,
-                logEvents=[
-                    {
-                        'timestamp': int(round(time.time() * 1000)),
-                        'message': log_message
-                    },
-                ],
-            )
-        )
-    except Exception as e:
-        logger.error(f"Error sending logs to CloudWatch: {e}")
+Base.metadata.create_all(bind=engine)
+print("Database initialized")
+@app.post("/items/")
+def create_item(name: str, description: str):
+    db = SessionLocal()
+    new_item = Item(name=name, description=description)
+    db.add(new_item)
+    db.commit()
+    db.refresh(new_item)
+    return new_item
 
+@app.get("/items/")
+def read_items():
+    db = SessionLocal()
+    items = db.query(Item).all()
+    return items
 
-async def create_users_table():
-    conn = await create_connection()
-    async with conn.cursor() as cursor:
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS users (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            name VARCHAR(255),
-            email VARCHAR(255)
-        );
-        """
-        try:
-            await cursor.execute(create_table_query)
-            await conn.commit()
-        except Exception as e:
-            print(f"Failed creating table: {e}")
-            raise
-        finally:
-            conn.close()
+@app.get("/items/{item_id}")
+def read_item(item_id: int):
+    db = SessionLocal()
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return item
 
-@asynccontextmanager
-async def app_lifespan(app: FastAPI):
-    # Startup logic: Creating users table
-    await create_users_table()
-    yield
+@app.put("/items/{item_id}")
+def update_item(item_id: int, name: str, description: str):
+    db = SessionLocal()
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
 
-app = FastAPI(lifespan=app_lifespan)
+    item.name = name
+    item.description = description
+    db.commit()
+    return item
 
-async def create_connection():
-    secret = await get_secret()
-    conn = await aiomysql.connect(
-        host=os.getenv("DB_HOST"),
-        user=secret["username"],
-        password=secret["password"],
-        db=secret["name"]
-    )
-    return conn
+@app.delete("/items/{item_id}")
+def delete_item(item_id: int):
+    db = SessionLocal()
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Item not found")
 
-
-@app.post("/users/")
-async def create_user(name: str, email: str):
-    conn = await create_connection()
-    async with conn.cursor() as cursor:
-        query = "INSERT INTO users (name, email) VALUES (%s, %s)"
-        values = (name, email)
-        await cursor.execute(query, values)
-        await conn.commit()
-    
-    conn.close()  # Ensure the connection is closed
-    await push_logs_to_cloudwatch(f"Create user with name {name} and email {email}")
-
-    return {"name": name, "email": email}
-
-@app.get("/users/")
-async def get_users():
-    conn = await create_connection()
-    async with conn.cursor() as cursor:
-        await cursor.execute("SELECT * FROM users")
-        users = await cursor.fetchall()
-    
-    conn.close()  # Ensure the connection is closed
-    await push_logs_to_cloudwatch("Get all users")
-
-    return users
-
-@app.put("/users/{user_id}")
-async def update_user(user_id: int, name: str, email: str):
-    conn = await create_connection()
-    async with conn.cursor() as cursor:
-        query = "UPDATE users SET name = %s, email = %s WHERE id = %s"
-        values = (name, email, user_id)
-        await cursor.execute(query, values)
-        await conn.commit()
-    
-    conn.close()  # Ensure the connection is closed
-    await push_logs_to_cloudwatch(f"Update user by id: {user_id}. Name: {name}. Email: {email}")
-
-    return {"id": user_id, "name": name, "email": email}
-
-
-@app.delete("/users/{user_id}")
-async def delete_user(user_id: int):
-    conn = await create_connection()
-    async with conn.cursor() as cursor:
-        query = "DELETE FROM users WHERE id = %s"
-        await cursor.execute(query, (user_id,))
-        affected_rows = cursor.rowcount  # Get the number of rows affected
-        await conn.commit()
-    
-    conn.close()  # Ensure the connection is closed
-    if affected_rows > 0:
-        await push_logs_to_cloudwatch(f"Delete user by id: {user_id}")
-        return {"status": "User deleted"}
-    else:
-        return {"status": "User not found"}
-
-
+    db.delete(item)
+    db.commit()
+    return {"detail": "Item deleted successfully"}
