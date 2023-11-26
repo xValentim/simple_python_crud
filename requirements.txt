@@ -5,4 +5,3 @@ pymysql
 boto3
 asyncio
 botocore
-contextlib
