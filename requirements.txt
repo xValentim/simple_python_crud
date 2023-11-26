@@ -2,3 +2,7 @@ fastapi
 uvicorn
 sqlalchemy
 pymysql
+boto3
+asyncio
+botocore
+contextlib
